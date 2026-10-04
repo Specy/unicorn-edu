@@ -1,0 +1,5 @@
+# build trees and downloads (scripts/build-*.sh)
+/build/
+node_modules/
+/ts/dist/
+*.log
