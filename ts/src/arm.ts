@@ -1,5 +1,5 @@
 import { UC_ARM_REG } from './arm-register-ids'
-import { PF_X, PT_LOAD, type ElfFile } from './elf'
+import type { Architecture, FloatingPointRegister, InstructionDecoder } from './architecture'
 
 export const UC_ARCH_ARM = 1
 export const UC_MODE_ARM = 0
@@ -46,35 +46,14 @@ export const ARM_REGISTER_IDS: Record<ArmRegisterName, number> = {
     pc: UC_ARM_REG.PC,
 }
 
-/**
- * The registers the machine layer snapshots per instruction, in native/edu.c's ARM_CORE_IDS
- * order: r0-r12, sp, lr, pc, cpsr.
- */
-export const ARM_CORE_SNAPSHOT_NAMES = [...ARM_REGISTER_NAMES, 'cpsr'] as const
-
-/** CPSR's condition flags, most significant first, as the Status flags show them. */
-export const ARM_FLAGS = [
-    { name: 'N', bit: 31 },
-    { name: 'Z', bit: 30 },
-    { name: 'C', bit: 29 },
-    { name: 'V', bit: 28 },
-] as const
-
 export const CPSR_THUMB = 1 << 5
 export const CPSR_MODE_USER = 0x10
 
-export const VFP_DOUBLE_NAMES = Array.from({ length: 32 }, (_, i) => `d${i}`)
-
-/** A name for every register id a history record can carry. */
-export function armRegisterName(id: number): string {
-    for (const [name, value] of Object.entries(ARM_REGISTER_IDS)) if (value === id) return name
-    if (id === UC_ARM_REG.CPSR) return 'cpsr'
-    if (id === UC_ARM_REG.FPSCR) return 'fpscr'
-    if (id >= UC_ARM_REG.D0 && id <= UC_ARM_REG.D31) return `d${id - UC_ARM_REG.D0}`
-    if (id >= UC_ARM_REG.S0 && id <= UC_ARM_REG.S31) return `s${id - UC_ARM_REG.S0}`
-    if (id >= UC_ARM_REG.Q0 && id <= UC_ARM_REG.Q15) return `q${id - UC_ARM_REG.Q0}`
-    return `reg${id}`
-}
+/** `d0`-`d31`, then `fpscr`: the VFP/NEON state the history saves (Q registers alias D pairs). */
+export const ARM_FLOATING_POINT_REGISTERS: FloatingPointRegister[] = [
+    ...Array.from({ length: 32 }, (_, i) => ({ name: `d${i}`, id: UC_ARM_REG.D0 + i, size: 8 })),
+    { name: 'fpscr', id: UC_ARM_REG.FPSCR, size: 4 },
+]
 
 /** Encodings that read or write the VFP/NEON registers (ARMv7-A A32). */
 export function isA32FloatingPoint(word: number): boolean {
@@ -100,67 +79,79 @@ export function isT32Wide(first: number): boolean {
     return top === 0x1d || top === 0x1e || top === 0x1f
 }
 
-export type FpMap = { base: bigint; halfwords: number; bits: Uint8Array }
+const decodeA32: InstructionDecoder = (view, offset) => ({
+    size: 4,
+    floatingPoint: offset + 4 <= view.byteLength && isA32FloatingPoint(view.getUint32(offset, true)),
+})
+
+const decodeT32: InstructionDecoder = (view, offset) => {
+    const first = view.getUint16(offset, true)
+    if (!isT32Wide(first) || offset + 4 > view.byteLength) return { size: 2, floatingPoint: false }
+    return { size: 4, floatingPoint: isT32FloatingPoint(first, view.getUint16(offset + 2, true)) }
+}
+
+function armRegisterName(id: number): string {
+    for (const [name, value] of Object.entries(ARM_REGISTER_IDS)) if (value === id) return name
+    if (id === UC_ARM_REG.CPSR) return 'cpsr'
+    if (id === UC_ARM_REG.FPSCR) return 'fpscr'
+    if (id >= UC_ARM_REG.D0 && id <= UC_ARM_REG.D31) return `d${id - UC_ARM_REG.D0}`
+    if (id >= UC_ARM_REG.S0 && id <= UC_ARM_REG.S31) return `s${id - UC_ARM_REG.S0}`
+    if (id >= UC_ARM_REG.Q0 && id <= UC_ARM_REG.Q15) return `q${id - UC_ARM_REG.Q0}`
+    return `reg${id}`
+}
 
 /**
- * Marks every instruction in the executable segments that may change the floating-point
- * registers, so that the history saves them around those instructions only. The mapping
- * symbols the assembler leaves (`$a` ARM, `$t` Thumb, `$d` data) say how to decode each range;
- * data decoded as instructions only costs a needless save.
+ * 32-bit ARM: ARMv7-A, A32 and Thumb-2 with VFPv4 and NEON, the Cortex-A15 Unicorn models by
+ * default. Programs run in user mode and talk to the host through Linux EABI system calls.
  */
-export function buildFpMap(elf: ElfFile): FpMap | null {
-    const code = elf.segments.filter((segment) => segment.type === PT_LOAD && segment.flags & PF_X)
-    if (!code.length) return null
-    const base = code.reduce((low, segment) => (segment.address < low ? segment.address : low), code[0]!.address)
-    const end = code.reduce((high, segment) => {
-        const segmentEnd = segment.address + BigInt(segment.memorySize)
-        return segmentEnd > high ? segmentEnd : high
-    }, base)
-    const halfwords = Number((end - base + 1n) / 2n)
-    const bits = new Uint8Array(Math.ceil(halfwords / 8))
-    const mark = (address: bigint) => {
-        const halfword = Number((address - base) / 2n)
-        bits[halfword >> 3]! |= 1 << (halfword & 7)
-    }
-
-    const states = elf.symbols
-        .filter((symbol) => /^\$[atd](\.|$)/.test(symbol.name))
-        .map((symbol) => ({ address: symbol.value, state: symbol.name[1] as 'a' | 't' | 'd' }))
-        .sort((left, right) => (left.address < right.address ? -1 : left.address > right.address ? 1 : 0))
-
-    for (const segment of code) {
-        const bytes = elf.bytes.subarray(segment.offset, segment.offset + segment.fileSize)
-        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-        let state: 'a' | 't' | 'd' = (elf.entry & 1n) === 1n ? 't' : 'a'
-        let next = 0
-        for (const marker of states) {
-            if (marker.address > segment.address) break
-            state = marker.state
-            next++
-        }
-        let offset = 0
-        while (offset < bytes.length) {
-            const address = segment.address + BigInt(offset)
-            while (next < states.length && states[next]!.address <= address) state = states[next++]!.state
-            if (state === 'd') {
-                offset += 2
-                continue
-            }
-            if (state === 'a') {
-                if (offset + 4 > bytes.length) break
-                if (isA32FloatingPoint(view.getUint32(offset, true))) mark(address)
-                offset += 4
-                continue
-            }
-            if (offset + 2 > bytes.length) break
-            const first = view.getUint16(offset, true)
-            if (isT32Wide(first) && offset + 4 <= bytes.length) {
-                if (isT32FloatingPoint(first, view.getUint16(offset + 2, true))) mark(address)
-                offset += 4
-            } else {
-                offset += 2
-            }
-        }
-    }
-    return { base, halfwords, bits }
+export const ARM: Architecture<ArmRegisterName> = {
+    name: 'arm',
+    ucArch: UC_ARCH_ARM,
+    ucMode: UC_MODE_ARM,
+    bits: 32,
+    loadMachine: async () => (await import('./wasm/machine-arm.mjs')).default(),
+    assembler: {
+        name: 'arm-as',
+        load: async () => (await import('./wasm/arm-as.mjs')).default,
+        wasm: () => new URL('./wasm/arm-as.wasm', import.meta.url),
+    },
+    linker: {
+        name: 'arm-ld',
+        load: async () => (await import('./wasm/arm-ld.mjs')).default,
+        wasm: () => new URL('./wasm/arm-ld.wasm', import.meta.url),
+    },
+    assemblerFlags: ['-mcpu=cortex-a15', '-mfpu=neon-vfpv4', '-mfloat-abi=hard'],
+    registerNames: ARM_REGISTER_NAMES,
+    registerIds: ARM_REGISTER_IDS,
+    coreSnapshot: [...ARM_REGISTER_NAMES, 'cpsr'],
+    pcName: 'pc',
+    flagsName: 'cpsr',
+    pcId: UC_ARM_REG.PC,
+    spId: UC_ARM_REG.SP,
+    linkId: UC_ARM_REG.LR,
+    flagsId: UC_ARM_REG.CPSR,
+    floatingPoint: ARM_FLOATING_POINT_REGISTERS,
+    systemCalls: {
+        numberRegister: UC_ARM_REG.R7,
+        argumentRegisters: [UC_ARM_REG.R0, UC_ARM_REG.R1, UC_ARM_REG.R2],
+        exit: [1, 248],
+        read: 3,
+        write: 4,
+        brk: 45,
+        nanosleep: 162,
+        clockGettime: 263,
+        timespecFieldSize: 4,
+    },
+    // mov r7, #1; svc #0
+    exitTrampoline: new Uint8Array([0x01, 0x70, 0xa0, 0xe3, 0x00, 0x00, 0x00, 0xef]),
+    mappingStates: { a: decodeA32, t: decodeT32, d: null },
+    defaultState: (entry) => ((entry & 1n) === 1n ? 't' : 'a'),
+    breakpointInstructionSize: (flags) => (flags & BigInt(CPSR_THUMB) ? 2 : 4),
+    // Unicorn takes the Thumb state from bit 0 of a PC write
+    pcValue: (address, flags) => (flags & BigInt(CPSR_THUMB) ? address | 1n : address),
+    registerName: armRegisterName,
+    initialRegisters: (entry) => [
+        // the mode first: sp and lr are banked, and the ones written next are the user-mode ones
+        { id: UC_ARM_REG.CPSR, value: BigInt(CPSR_MODE_USER | ((entry & 1n) === 1n ? CPSR_THUMB : 0)) },
+    ],
 }

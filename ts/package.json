@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "An educational ARM emulator for JavaScript: Unicorn with a debugger layer, plus GNU as and ld, all in WebAssembly",
+  "description": "Educational ARM and AArch64 emulators for JavaScript: Unicorn with a debugger layer, plus GNU as and ld, all in WebAssembly",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Specy/unicorn-edu.git",
@@ -23,7 +23,7 @@
   ],
   "scripts": {
     "build": "tsdown && node scripts/copy-assets.mjs",
-    "build:wasm": "../scripts/build-unicorn.sh arm && ../scripts/build-binutils.sh arm",
+    "build:wasm": "../scripts/build-unicorn.sh arm && ../scripts/build-unicorn.sh aarch64 && ../scripts/build-binutils.sh arm && ../scripts/build-binutils.sh aarch64",
     "test": "vitest run",
     "type-check": "tsc --noEmit",
     "measure": "vitest run --config vitest.measure.config.ts --disable-console-intercept",

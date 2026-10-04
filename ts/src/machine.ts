@@ -1,4 +1,5 @@
-import createMachineModule, { type MachineModule } from './wasm/machine-arm.mjs'
+import type { Architecture } from './architecture'
+import type { MachineModule } from './wasm/machine-arm.mjs'
 
 export type { MachineModule }
 
@@ -43,12 +44,17 @@ export type RawHistory = {
     entries: RawEntry[]
 }
 
-let modulePromise: Promise<MachineModule> | undefined
+const modules = new Map<string, Promise<MachineModule>>()
 
-/** The machine module, instantiated once and shared by every Machine. */
-export function loadMachineModule(): Promise<MachineModule> {
-    modulePromise ??= createMachineModule()
-    return modulePromise
+/** An architecture's machine module, instantiated once and shared by every Machine of it. */
+export function loadMachineModule(architecture: Architecture): Promise<MachineModule> {
+    let module = modules.get(architecture.name)
+    if (!module) {
+        module = architecture.loadMachine()
+        modules.set(architecture.name, module)
+        module.catch(() => modules.delete(architecture.name))
+    }
+    return module
 }
 
 export class MachineError extends Error {

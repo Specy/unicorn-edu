@@ -6,7 +6,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
 // The Emscripten modules are never bundled and load their .wasm from beside
 // themselves, so each .mjs lands in dist/wasm/ together with its .wasm and types.
-const files = ['machine-arm', 'arm-as', 'arm-ld'].flatMap((name) => [
+const files = ['machine-arm', 'arm-as', 'arm-ld', 'machine-aarch64', 'aarch64-as', 'aarch64-ld'].flatMap((name) => [
   `${name}.mjs`,
   `${name}.wasm`,
   `${name}.d.mts`,

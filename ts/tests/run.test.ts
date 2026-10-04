@@ -51,7 +51,7 @@ describe('running', () => {
         expect(emulator.getPc()).toBe(0x10000n)
         expect(emulator.getSp()).toBe(0x80000000n)
         expect(emulator.getRegisterValue('lr')).toBe(0x1000n)
-        expect(emulator.getCpsr() & 0x1f).toBe(0x10)
+        expect(emulator.getFlagsRegister() & 0x1fn).toBe(0x10n)
         expect(emulator.getNextInstruction()).toMatchObject({ lineNumber: lineOf(HELLO, 'mov r0, #1'), code: 'mov r0, #1' })
     })
 
@@ -148,7 +148,7 @@ double:
     bx lr
 `
         const { emulator } = await load(source)
-        expect(emulator.getCpsr() & (1 << 5)).not.toBe(0)
+        expect(emulator.getFlagsRegister() & (1n << 5n)).not.toBe(0n)
         expect(await emulator.run(1000)).toMatchObject({ kind: 'exit', exitCode: 0x20004 })
     })
 
@@ -166,7 +166,7 @@ _start:
 `
         const { emulator } = await load(source)
         expect(await emulator.run(1000)).toMatchObject({ kind: 'exit', exitCode: 3 })
-        expect(doubleFromBits(emulator.getVfpRegisters().d[1]!)).toBe(3)
+        expect(doubleFromBits(emulator.getFloatingPointRegisterValues()[1]!)).toBe(3)
     })
 })
 

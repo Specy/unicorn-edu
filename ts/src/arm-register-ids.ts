@@ -1,4 +1,4 @@
-// Generated from third_party/unicorn/include/unicorn/arm.h by scripts/gen-arm-registers.py.
+// Generated from third_party/unicorn/include/unicorn/arm.h by scripts/gen-register-ids.py.
 // Unicorn register ids, as the machine layer takes them.
 export const UC_ARM_REG = {
     APSR: 1,
@@ -106,22 +106,7 @@ export const UC_ARM_REG = {
     S30: 109,
     S31: 110,
     C1_C0_2: 111,
-    IPSR: 114,
-    MSP: 115,
-    PSP: 116,
-    CONTROL: 117,
-    IAPSR: 118,
-    EAPSR: 119,
-    XPSR: 120,
-    EPSR: 121,
-    IEPSR: 122,
-    PRIMASK: 123,
-    BASEPRI: 124,
-    BASEPRI_MAX: 125,
-    FAULTMASK: 126,
     R13: 12,
     R14: 10,
     R15: 11,
 } as const
-
-export type UcArmRegisterName = keyof typeof UC_ARM_REG

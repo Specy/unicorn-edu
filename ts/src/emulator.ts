@@ -1,17 +1,6 @@
-import {
-    ARM_CORE_SNAPSHOT_NAMES,
-    ARM_FLAGS,
-    ARM_REGISTER_IDS,
-    ARM_REGISTER_NAMES,
-    CPSR_MODE_USER,
-    CPSR_THUMB,
-    UC_ARCH_ARM,
-    UC_MODE_ARM,
-    armRegisterName,
-    buildFpMap,
-    type ArmRegisterName,
-} from './arm'
-import { UC_ARM_REG } from './arm-register-ids'
+import { AARCH64, type Aarch64RegisterName } from './aarch64'
+import { ARM, type ArmRegisterName } from './arm'
+import { buildFpMap, findCodeEnd, type Architecture } from './architecture'
 import { readLineTable } from './dwarf-line'
 import { PF_R, PF_W, PF_X, PT_LOAD, SHN_UNDEF, parseElf, sectionBytes, type ElfFile } from './elf'
 import {
@@ -51,7 +40,7 @@ import {
     type StackFrame,
 } from './types'
 
-export type ArmEmulatorOptions = {
+export type EmulatorOptions = {
     /** Text the program writes to file descriptor 1, decoded as UTF-8 as it arrives. */
     stdout?: (text: string) => void
     /** Text the program writes to file descriptor 2. */
@@ -65,6 +54,9 @@ export type ArmEmulatorOptions = {
     now?: () => number
     layout?: Partial<MemoryLayout>
 }
+
+/** @deprecated the options are the same for every architecture: use EmulatorOptions. */
+export type ArmEmulatorOptions = EmulatorOptions
 
 /**
  * Thrown by a run that was waiting for input when the host loaded another program (or the same
@@ -96,13 +88,6 @@ type Program = {
     lines: Map<string, string[]>
 }
 
-const SYSCALL_EXIT = 1
-const SYSCALL_READ = 3
-const SYSCALL_WRITE = 4
-const SYSCALL_BRK = 45
-const SYSCALL_NANOSLEEP = 162
-const SYSCALL_EXIT_GROUP = 248
-const SYSCALL_CLOCK_GETTIME = 263
 const EBADF = 9
 const EFAULT = 14
 
@@ -110,36 +95,32 @@ const PAGE = 0x1000n
 const alignDown = (value: bigint) => value & ~(PAGE - 1n)
 const alignUp = (value: bigint) => (value + PAGE - 1n) & ~(PAGE - 1n)
 
+/** CPSR and NZCV keep the condition flags in the same bits. */
+const CONDITION_FLAGS = [
+    { name: 'N', bit: 31n },
+    { name: 'Z', bit: 30n },
+    { name: 'C', bit: 29n },
+    { name: 'V', bit: 28n },
+] as const
+
 function littleEndian(bytes: Uint8Array): bigint {
     let value = 0n
     for (let i = bytes.length - 1; i >= 0; i--) value = (value << 8n) | BigInt(bytes[i]!)
     return value
 }
 
-function toSigned32(value: bigint): number {
-    return Number(BigInt.asIntN(32, value))
+function toLittleEndian(value: bigint, size: number): Uint8Array {
+    const bytes = new Uint8Array(size)
+    for (let i = 0; i < size; i++) bytes[i] = Number((value >> BigInt(8 * i)) & 0xffn)
+    return bytes
 }
 
-/**
- * Where the last run of instructions in `.text` ends: at the data (a literal pool) that follows it,
- * or at the end of the section. The assembler's mapping symbols say which ranges are code (`$a`,
- * `$t`) and which are data (`$d`), so this holds for code that has no line information too.
- */
-function findCodeEnd(elf: ElfFile): bigint | null {
-    const text = elf.sections.find((section) => section.name === '.text')
-    if (!text || !text.size) return null
-    const end = text.address + BigInt(text.size)
-    const markers = elf.symbols
-        .filter((symbol) => /^\$[atd](\.|$)/.test(symbol.name) && symbol.value >= text.address && symbol.value < end)
-        .map((symbol) => ({ address: symbol.value, code: symbol.name[1] !== 'd' }))
-        .sort((left, right) => (left.address < right.address ? -1 : left.address > right.address ? 1 : 0))
-    let lastCode = -1
-    markers.forEach((marker, index) => {
-        if (marker.code) lastCode = index
-    })
-    if (lastCode < 0) return end
-    const data = markers.slice(lastCode + 1).find((marker) => !marker.code)
-    return data ? data.address : end
+function registerSize(bytes: number): RegisterSize {
+    if (bytes >= 16) return RegisterSize.Quad
+    if (bytes >= 8) return RegisterSize.Double
+    if (bytes >= 4) return RegisterSize.Long
+    if (bytes >= 2) return RegisterSize.Word
+    return RegisterSize.Byte
 }
 
 function frameColor(index: number): string {
@@ -147,12 +128,12 @@ function frameColor(index: number): string {
 }
 
 /**
- * An ARM (ARMv7-A, A32 and Thumb-2, VFPv4/NEON) machine for an IDE: assembles and links a Project
- * with GNU as and ld, loads the program, and runs it under Unicorn with breakpoints, Undo, Pokes
- * and a call stack. Programs talk to the host through Linux EABI system calls (`svc #0`, number
- * in r7).
+ * A machine of the ARM family for an IDE: assembles and links a Project with GNU as and ld,
+ * loads the program, and runs it under Unicorn with breakpoints, Undo, Pokes and a call stack.
+ * Programs talk to the host through Linux system calls (`svc #0`). `R` names the general
+ * registers of the architecture.
  */
-export class ArmEmulator {
+export class UnicornEmulator<R extends string = string> {
     private program: Program | null = null
     private machine: Machine | null = null
     private readonly layout: MemoryLayout
@@ -169,14 +150,22 @@ export class ArmEmulator {
     private readonly stderrDecoder = new TextDecoder()
 
     private constructor(
+        readonly architecture: Architecture<R>,
         private readonly module: MachineModule,
-        private readonly options: ArmEmulatorOptions,
+        private readonly options: EmulatorOptions,
     ) {
         this.layout = { ...DEFAULT_LAYOUT, ...options.layout }
     }
 
-    static async create(options: ArmEmulatorOptions = {}): Promise<ArmEmulator> {
-        return new ArmEmulator(await loadMachineModule(), options)
+    static async create<R extends string>(
+        architecture: Architecture<R>,
+        options: EmulatorOptions = {},
+    ): Promise<UnicornEmulator<R>> {
+        return new UnicornEmulator(architecture, await loadMachineModule(architecture), options)
+    }
+
+    private get registerBits(): number {
+        return this.architecture.bits
     }
 
     // ----- building -----
@@ -211,9 +200,9 @@ export class ArmEmulator {
     }
 
     private async build(project: ArmProject): Promise<{ program: Program | null; diagnostics: ArmDiagnostic[] }> {
-        const assembled = await assembleProject(project)
+        const assembled = await assembleProject(project, this.architecture)
         if (!assembled.ok) return { program: null, diagnostics: assembled.diagnostics }
-        const linked = await linkProgram(assembled.units, project, this.layout)
+        const linked = await linkProgram(assembled.units, project, this.architecture, this.layout)
         const diagnostics = [...assembled.diagnostics, ...linked.diagnostics]
         if (!linked.elf) return { program: null, diagnostics }
         const elf = parseElf(linked.elf)
@@ -246,7 +235,6 @@ export class ArmEmulator {
             const path = normalizePath(file.startsWith(`${WORK_DIRECTORY}/`) ? file.slice(WORK_DIRECTORY.length + 1) : file)
             return path in project.files ? path : null
         })
-        const codeEnd = findCodeEnd(elf)
         const symbols = elf.symbols
             .filter(
                 (symbol) =>
@@ -262,17 +250,18 @@ export class ArmEmulator {
         for (const [path, content] of Object.entries(project.files)) {
             if (typeof content === 'string') lines.set(path, content.split('\n'))
         }
-        return { project, elf, sourceMap, entry, codeEnd, symbols, lines }
+        return { project, elf, sourceMap, entry, codeEnd: findCodeEnd(elf, this.architecture), symbols, lines }
     }
 
     /**
      * Loads the last successful build into a fresh machine with `undoSize` steps of history: its
      * segments, a stack, the return trampoline, and the registers a program starts with (all zero
-     * except sp, lr and pc, in user mode).
+     * except the stack pointer, the link register and the program counter).
      */
     initialize(undoSize: number): void {
         const program = this.program
         if (!program) throw new Error('There is no program to load: compile one first')
+        const architecture = this.architecture
         this.machine?.destroy()
         this.machine = null
         this.termination = null
@@ -282,7 +271,7 @@ export class ArmEmulator {
         this.stdinBuffer = new Uint8Array(0)
         this.stdinEnded = false
 
-        const machine = Machine.create(this.module, UC_ARCH_ARM, UC_MODE_ARM)
+        const machine = Machine.create(this.module, architecture.ucArch, architecture.ucMode)
         this.machine = machine
         const { elf } = program
 
@@ -326,10 +315,9 @@ export class ArmEmulator {
             }
         }
 
-        // exit(r0) for a program that returns from its entry point: mov r7, #1; svc #0
         const trampoline = BigInt(this.layout.returnTrampoline)
         machine.map(trampoline, PAGE, UC_PROT_READ | UC_PROT_EXEC)
-        machine.writeMemory(trampoline, new Uint8Array([0x01, 0x70, 0xa0, 0xe3, 0x00, 0x00, 0x00, 0xef]))
+        machine.writeMemory(trampoline, architecture.exitTrampoline)
 
         const stackTop = BigInt(this.layout.stackTop)
         machine.map(stackTop - BigInt(this.layout.stackSize), BigInt(this.layout.stackSize), UC_PROT_READ | UC_PROT_WRITE)
@@ -338,15 +326,13 @@ export class ArmEmulator {
         this.heapBreak = this.heapStart
         this.heapMapped = this.heapStart
 
-        const thumb = (program.entry & 1n) === 1n
-        // the mode first: sp and lr are banked, and these are the user-mode ones
-        machine.writeRegister(UC_ARM_REG.CPSR, BigInt(CPSR_MODE_USER | (thumb ? CPSR_THUMB : 0)))
-        machine.writeRegister(UC_ARM_REG.SP, stackTop)
-        machine.writeRegister(UC_ARM_REG.LR, trampoline)
-        machine.writeRegister(UC_ARM_REG.PC, program.entry & ~1n)
-        machine.writeRegister(UC_ARM_REG.CPSR, BigInt(CPSR_MODE_USER | (thumb ? CPSR_THUMB : 0)))
+        for (const { id, value } of architecture.initialRegisters(program.entry)) machine.writeRegister(id, value)
+        machine.writeRegister(architecture.spId, stackTop)
+        machine.writeRegister(architecture.linkId, trampoline)
+        const flags = machine.readRegister(architecture.flagsId)
+        machine.writeRegister(architecture.pcId, architecture.pcValue(program.entry & ~1n, flags))
 
-        const fpMap = buildFpMap(elf)
+        const fpMap = buildFpMap(elf, architecture)
         if (fpMap) machine.setFpMap(fpMap.base, fpMap.bits, fpMap.halfwords)
         machine.setHistory(Number.isFinite(undoSize) ? Math.max(0, Math.floor(undoSize)) : 0)
         this.applyBreakpoints([])
@@ -421,9 +407,8 @@ export class ArmEmulator {
                     return { kind: 'limit', executed }
                 case StopReason.Breakpoint: {
                     const pc = this.getPc()
-                    const program = this.requireProgram()
                     // gas gives a literal pool the line of its .ltorg, so only the address says it is data
-                    if (pc === program.codeEnd) {
+                    if (pc === this.requireProgram().codeEnd) {
                         this.termination = { kind: 'end' }
                         return this.terminationResult(executed)
                     }
@@ -440,11 +425,11 @@ export class ArmEmulator {
                         continue
                     }
                     if (number === ARM_EXCEPTION_BKPT) {
-                        // QEMU leaves the PC on the bkpt, so resuming would stop on it again for
-                        // ever. Bit 0 keeps the Thumb state: Unicorn sets the state from it.
-                        const thumb = (this.getCpsr() & CPSR_THUMB) !== 0
-                        const next = this.getPc() + (thumb ? 2n : 4n)
-                        machine.writeRegister(UC_ARM_REG.PC, thumb ? next | 1n : next, true)
+                        // QEMU leaves the PC on a bkpt or brk, so resuming would stop on it again
+                        // for ever
+                        const flags = machine.readRegister(this.architecture.flagsId)
+                        const next = this.getPc() + BigInt(this.architecture.breakpointInstructionSize(flags))
+                        machine.writeRegister(this.architecture.pcId, this.architecture.pcValue(next, flags), true)
                         return { kind: 'pause', executed }
                     }
                     return this.fault(`The program raised exception ${number}`, executed)
@@ -489,43 +474,70 @@ export class ArmEmulator {
     }
 
     private setReturnValue(value: number | bigint): void {
-        this.requireMachine().writeRegister(UC_ARM_REG.R0, BigInt.asUintN(32, BigInt(value)), true)
+        const result = this.architecture.systemCalls.argumentRegisters[0]
+        this.requireMachine().writeRegister(result, BigInt.asUintN(this.registerBits, BigInt(value)), true)
+    }
+
+    private readTimespec(address: bigint): number {
+        const size = this.architecture.systemCalls.timespecFieldSize
+        const view = new DataView(this.requireMachine().readMemory(address, size * 2).buffer)
+        const seconds = size === 8 ? Number(view.getBigUint64(0, true)) : view.getUint32(0, true)
+        const nanoseconds = size === 8 ? Number(view.getBigUint64(8, true)) : view.getUint32(4, true)
+        return seconds * 1000 + nanoseconds / 1e6
+    }
+
+    private encodeTimespec(milliseconds: number): Uint8Array {
+        const size = this.architecture.systemCalls.timespecFieldSize
+        const seconds = Math.floor(milliseconds / 1000)
+        const nanoseconds = Math.floor((milliseconds - seconds * 1000) * 1e6)
+        const bytes = new Uint8Array(size * 2)
+        const view = new DataView(bytes.buffer)
+        if (size === 8) {
+            view.setBigUint64(0, BigInt(seconds), true)
+            view.setBigUint64(8, BigInt(nanoseconds), true)
+        } else {
+            view.setUint32(0, seconds >>> 0, true)
+            view.setUint32(4, nanoseconds >>> 0, true)
+        }
+        return bytes
     }
 
     /** Answers the `svc` that stopped the run; null when the program simply continues. */
     private async systemCall(): Promise<Omit<ArmRunResult, 'executed'> | null> {
         const machine = this.requireMachine()
-        const [r0, r1, r2, r7] = machine.readRegisters([UC_ARM_REG.R0, UC_ARM_REG.R1, UC_ARM_REG.R2, UC_ARM_REG.R7])
-        switch (Number(r7)) {
-            case SYSCALL_EXIT:
-            case SYSCALL_EXIT_GROUP: {
-                const code = toSigned32(r0!)
-                this.termination = { kind: 'exit', code }
-                return { kind: 'exit', exitCode: code }
-            }
-            case SYSCALL_WRITE: {
-                const fd = Number(r0)
-                const length = Number(r2)
+        const calls = this.architecture.systemCalls
+        const [first, second, third, number] = machine.readRegisters([...calls.argumentRegisters, calls.numberRegister])
+        const call = Number(number)
+        if (calls.exit.includes(call)) {
+            // an exit status is an int whatever the register width
+            const code = Number(BigInt.asIntN(32, first!))
+            this.termination = { kind: 'exit', code }
+            return { kind: 'exit', exitCode: code }
+        }
+        switch (call) {
+            case calls.write: {
+                const fd = Number(first)
                 if (fd !== 1 && fd !== 2) {
                     this.setReturnValue(-EBADF)
                     return null
                 }
-                const bytes = machine.readMemory(r1!, length)
+                const length = Number(third)
+                const bytes = machine.readMemory(second!, length)
                 const decoder = fd === 1 ? this.stdoutDecoder : this.stderrDecoder
                 const text = decoder.decode(bytes, { stream: true })
                 if (text) (fd === 1 ? this.options.stdout : this.options.stderr)?.(text)
                 this.setReturnValue(length)
                 return null
             }
-            case SYSCALL_READ: {
-                if (Number(r0) !== 0) {
+            case calls.read: {
+                if (Number(first) !== 0) {
                     this.setReturnValue(-EBADF)
                     return null
                 }
-                const bytes = await this.readInput(Number(r2))
+                const bytes = await this.readInput(Number(third))
                 if (this.machine !== machine) throw new ArmEmulatorSupersededError()
                 try {
-                    if (bytes.length) machine.writeMemory(r1!, bytes, true)
+                    if (bytes.length) machine.writeMemory(second!, bytes, true)
                 } catch {
                     this.setReturnValue(-EFAULT)
                     return null
@@ -533,8 +545,8 @@ export class ArmEmulator {
                 this.setReturnValue(bytes.length)
                 return null
             }
-            case SYSCALL_BRK: {
-                const requested = r0!
+            case calls.brk: {
+                const requested = first!
                 if (requested > this.heapBreak && requested <= this.heapStart + BigInt(this.layout.heapLimit)) {
                     const needed = alignUp(requested)
                     if (needed > this.heapMapped) {
@@ -548,16 +560,9 @@ export class ArmEmulator {
                 this.setReturnValue(this.heapBreak)
                 return null
             }
-            case SYSCALL_CLOCK_GETTIME: {
-                const milliseconds = (this.options.now ?? Date.now)()
-                const seconds = Math.floor(milliseconds / 1000)
-                const nanoseconds = Math.floor((milliseconds - seconds * 1000) * 1e6)
-                const timespec = new Uint8Array(8)
-                const view = new DataView(timespec.buffer)
-                view.setUint32(0, seconds >>> 0, true)
-                view.setUint32(4, nanoseconds >>> 0, true)
+            case calls.clockGettime: {
                 try {
-                    machine.writeMemory(r1!, timespec, true)
+                    machine.writeMemory(second!, this.encodeTimespec((this.options.now ?? Date.now)()), true)
                 } catch {
                     this.setReturnValue(-EFAULT)
                     return null
@@ -565,15 +570,14 @@ export class ArmEmulator {
                 this.setReturnValue(0)
                 return null
             }
-            case SYSCALL_NANOSLEEP: {
-                const view = new DataView(machine.readMemory(r0!, 8).buffer)
-                const waitMs = view.getUint32(0, true) * 1000 + view.getUint32(4, true) / 1e6
+            case calls.nanosleep: {
+                const waitMs = this.readTimespec(first!)
                 this.setReturnValue(0)
                 return { kind: 'wait', waitMs }
             }
             default: {
-                const reason = `Unsupported system call ${Number(r7)} (the number in r7)`
-                const result = this.fault(reason, 0)
+                const name = this.architecture.registerName(calls.numberRegister)
+                const result = this.fault(`Unsupported system call ${call} (the number in ${name})`, 0)
                 return { kind: result.kind, message: result.message, address: result.address }
             }
         }
@@ -614,60 +618,77 @@ export class ArmEmulator {
     }
 
     getPc(): bigint {
-        return this.requireMachine().readRegister(UC_ARM_REG.PC)
+        return this.requireMachine().readRegister(this.architecture.pcId)
     }
 
     getSp(): bigint {
-        return this.requireMachine().readRegister(UC_ARM_REG.SP)
+        return this.requireMachine().readRegister(this.architecture.spId)
     }
 
-    getCpsr(): number {
-        return Number(this.requireMachine().readRegister(UC_ARM_REG.CPSR))
+    /** The register holding the condition flags: CPSR on ARM, NZCV on AArch64. */
+    getFlagsRegister(): bigint {
+        return this.requireMachine().readRegister(this.architecture.flagsId)
     }
 
     getFlags(): { name: string; value: number }[] {
-        const cpsr = this.getCpsr()
-        return ARM_FLAGS.map(({ name, bit }) => ({ name, value: (cpsr >>> bit) & 1 }))
+        const flags = this.getFlagsRegister()
+        return CONDITION_FLAGS.map(({ name, bit }) => ({ name, value: Number((flags >> bit) & 1n) }))
     }
 
-    /** r0-r12, sp, lr, pc, unsigned. */
+    /** The general registers, unsigned, in `architecture.registerNames` order. */
     getRegisterValues(): bigint[] {
-        return this.requireMachine().readRegisters(ARM_REGISTER_NAMES.map((name) => ARM_REGISTER_IDS[name]))
+        const ids = this.architecture.registerNames.map((name) => this.architecture.registerIds[name])
+        return this.requireMachine().readRegisters(ids)
     }
 
-    getRegisterValuesRecord(): Record<ArmRegisterName, bigint> {
+    getRegisterValuesRecord(): Record<R, bigint> {
         const values = this.getRegisterValues()
-        return Object.fromEntries(ARM_REGISTER_NAMES.map((name, index) => [name, values[index]!])) as Record<
-            ArmRegisterName,
+        return Object.fromEntries(this.architecture.registerNames.map((name, index) => [name, values[index]!])) as Record<
+            R,
             bigint
         >
     }
 
-    getRegisterValue(register: ArmRegisterName): bigint {
-        return this.requireMachine().readRegister(ARM_REGISTER_IDS[register])
+    getRegisterValue(register: R): bigint {
+        return this.requireMachine().readRegister(this.architecture.registerIds[register])
     }
 
     /** A direct write, or one value of the open Poke. */
-    setRegisterValue(register: ArmRegisterName, value: bigint): void {
-        this.requireMachine().writeRegister(ARM_REGISTER_IDS[register], BigInt.asUintN(32, value), this.pokeOpen)
+    setRegisterValue(register: R, value: bigint): void {
+        this.requireMachine().writeRegister(
+            this.architecture.registerIds[register],
+            BigInt.asUintN(this.registerBits, value),
+            this.pokeOpen,
+        )
     }
 
-    /** `d0`-`d31` as 64-bit patterns, then `fpscr`. */
-    getVfpRegisters(): { d: bigint[]; fpscr: number } {
-        const ids = [...Array.from({ length: 32 }, (_, i) => UC_ARM_REG.D0 + i), UC_ARM_REG.FPSCR]
-        const values = this.requireMachine().readRegisters(ids)
-        return { d: values.slice(0, 32), fpscr: Number(values[32]) }
+    /**
+     * The floating-point and SIMD registers, unsigned, in `architecture.floatingPoint` order:
+     * `d0`-`d31` and `fpscr` on ARM, `v0`-`v31` (128 bits) with `fpcr` and `fpsr` on AArch64.
+     */
+    getFloatingPointRegisterValues(): bigint[] {
+        const machine = this.requireMachine()
+        const narrow = this.architecture.floatingPoint.filter((register) => register.size <= 8)
+        const values = new Map<number, bigint>()
+        machine.readRegisters(narrow.map((register) => register.id)).forEach((value, index) => {
+            values.set(narrow[index]!.id, value)
+        })
+        return this.architecture.floatingPoint.map((register) =>
+            register.size <= 8
+                ? values.get(register.id)!
+                : littleEndian(machine.readRegisterBytes(register.id, register.size)),
+        )
     }
 
-    setVfpRegister(name: string, value: bigint): void {
-        const id =
-            name === 'fpscr'
-                ? UC_ARM_REG.FPSCR
-                : /^d([0-9]|[12][0-9]|3[01])$/.test(name)
-                  ? UC_ARM_REG.D0 + Number(name.slice(1))
-                  : null
-        if (id === null) throw new Error(`Unknown VFP register ${name}`)
-        this.requireMachine().writeRegister(id, BigInt.asUintN(name === 'fpscr' ? 32 : 64, value), this.pokeOpen)
+    /** A direct write, or one value of the open Poke. */
+    setFloatingPointRegister(name: string, value: bigint): void {
+        const register = this.architecture.floatingPoint.find((candidate) => candidate.name === name)
+        if (!register) throw new Error(`Unknown floating-point register ${name}`)
+        this.requireMachine().writeRegisterBytes(
+            register.id,
+            toLittleEndian(BigInt.asUintN(register.size * 8, value), register.size),
+            this.pokeOpen,
+        )
     }
 
     readMemoryBytes(address: bigint, length: number): Uint8Array {
@@ -723,28 +744,34 @@ export class ArmEmulator {
     }
 
     private describeStep(entry: RawEntry, after: bigint[]): ExecutionStep {
-        const cpsrIndex = ARM_CORE_SNAPSHOT_NAMES.indexOf('cpsr')
+        const architecture = this.architecture
+        const flagsIndex = architecture.coreSnapshot.indexOf(architecture.flagsName)
         const mutations: MutationOperation[] = []
         const writes: PokeWrite[] = []
-        const coreIds = new Set<number>([...Object.values(ARM_REGISTER_IDS), UC_ARM_REG.CPSR])
+        const coreIds = new Set<number>([
+            ...architecture.registerNames.map((name) => architecture.registerIds[name]),
+            architecture.flagsId,
+        ])
         if (entry.kind === 'instruction') {
-            ARM_CORE_SNAPSHOT_NAMES.forEach((name, index) => {
-                if (name === 'pc' || name === 'cpsr') return
+            architecture.coreSnapshot.forEach((name, index) => {
+                if (name === architecture.pcName || name === architecture.flagsName) return
                 const old = entry.core[index]!
                 const value = after[index]!
                 if (old !== value) {
-                    mutations.push({ type: 'WriteRegister', value: { register: name, old, new: value, size: RegisterSize.Long } })
+                    mutations.push({
+                        type: 'WriteRegister',
+                        value: { register: name, old, new: value, size: registerSize(this.registerBits / 8) },
+                    })
                 }
             })
         }
         for (const record of entry.registers) {
             // an instruction's core registers are already in the snapshot difference
             if (entry.kind === 'instruction' && coreIds.has(record.id)) continue
-            const name = armRegisterName(record.id)
+            const name = architecture.registerName(record.id)
             const old = littleEndian(record.old)
             const value = littleEndian(record.new)
-            const size = record.size === 16 ? RegisterSize.Quad : record.size === 8 ? RegisterSize.Double : RegisterSize.Long
-            mutations.push({ type: 'WriteRegister', value: { register: name, old, new: value, size } })
+            mutations.push({ type: 'WriteRegister', value: { register: name, old, new: value, size: registerSize(record.size) } })
             if (entry.kind === 'poke') writes.push({ type: 'register', name, old, new: value })
         }
         for (const record of entry.memory) {
@@ -763,8 +790,8 @@ export class ArmEmulator {
             kind: entry.kind,
             mutations,
             pc: Number(entry.pc),
-            old_ccr: { bits: Number(entry.core[cpsrIndex]) },
-            new_ccr: { bits: Number(after[cpsrIndex]) },
+            old_ccr: { bits: Number(entry.core[flagsIndex]) },
+            new_ccr: { bits: Number(after[flagsIndex]) },
             line: location?.line ?? -1,
             file: location?.path,
             writes: entry.kind === 'poke' ? writes : undefined,
@@ -795,10 +822,9 @@ export class ArmEmulator {
     getCallStack(): StackFrame[] {
         if (!this.machine) return []
         return this.machine.callStack().map((frame, index) => {
-            const symbol = this.nearestSymbol(frame.target)
             const location = this.program?.sourceMap.locate(frame.target)
             return {
-                name: symbol && symbol.address === frame.target ? symbol.name : (symbol?.name ?? ''),
+                name: this.nearestSymbol(frame.target)?.name ?? '',
                 address: frame.target,
                 destination: frame.returnAddress,
                 sp: frame.sp,
@@ -861,6 +887,22 @@ export class ArmEmulator {
     }
 }
 
-export async function createArmEmulator(options: ArmEmulatorOptions = {}): Promise<ArmEmulator> {
-    return ArmEmulator.create(options)
+export type ArmEmulator = UnicornEmulator<ArmRegisterName>
+export type Aarch64Emulator = UnicornEmulator<Aarch64RegisterName>
+
+export function createEmulator<R extends string>(
+    architecture: Architecture<R>,
+    options: EmulatorOptions = {},
+): Promise<UnicornEmulator<R>> {
+    return UnicornEmulator.create(architecture, options)
+}
+
+/** 32-bit ARM: ARMv7-A, A32 and Thumb-2, VFPv4 and NEON. */
+export function createArmEmulator(options: EmulatorOptions = {}): Promise<ArmEmulator> {
+    return UnicornEmulator.create(ARM, options)
+}
+
+/** AArch64: ARMv8-A A64 with FP and Advanced SIMD. */
+export function createAarch64Emulator(options: EmulatorOptions = {}): Promise<Aarch64Emulator> {
+    return UnicornEmulator.create(AARCH64, options)
 }

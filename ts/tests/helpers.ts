@@ -1,17 +1,37 @@
-import { createArmEmulator, type ArmEmulator, type ArmEmulatorOptions, type ArmProject } from '../src'
+import {
+    AARCH64,
+    ARM,
+    createEmulator,
+    type Architecture,
+    type ArmProject,
+    type EmulatorOptions,
+    type UnicornEmulator,
+} from '../src'
 
-export type Loaded = {
-    emulator: ArmEmulator
+export type Loaded<R extends string> = {
+    emulator: UnicornEmulator<R>
     stdout: () => string
 }
 
-/** Builds and loads a program, failing the test with the build report when it does not build. */
-export async function load(
+type LoadOptions = EmulatorOptions & { undo?: number }
+
+/** Builds and loads an ARM program, failing the test with the build report when it does not build. */
+export function load(source: string | ArmProject, options: LoadOptions = {}) {
+    return loadFor(ARM, source, options)
+}
+
+/** The same for AArch64. */
+export function loadAarch64(source: string | ArmProject, options: LoadOptions = {}) {
+    return loadFor(AARCH64, source, options)
+}
+
+async function loadFor<R extends string>(
+    architecture: Architecture<R>,
     source: string | ArmProject,
-    options: ArmEmulatorOptions & { undo?: number } = {},
-): Promise<Loaded> {
+    options: LoadOptions,
+): Promise<Loaded<R>> {
     let stdout = ''
-    const emulator = await createArmEmulator({
+    const emulator = await createEmulator(architecture, {
         ...options,
         stdout: (text) => {
             stdout += text
@@ -31,7 +51,7 @@ export function lineOf(source: string, needle: string): number {
     return index
 }
 
-export function readU32(emulator: ArmEmulator, address: bigint): number {
+export function readU32(emulator: UnicornEmulator, address: bigint): number {
     return new DataView(emulator.readMemoryBytes(address, 4).buffer).getUint32(0, true)
 }
 

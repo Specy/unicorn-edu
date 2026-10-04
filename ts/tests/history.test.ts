@@ -107,11 +107,11 @@ _start:
             { type: 'WriteRegister', value: { register: 'd1', old: 0n, new: 0x4008000000000000n, size: 8 } },
         ])
         emulator.undo()
-        expect(doubleFromBits(emulator.getVfpRegisters().d[0]!)).toBe(1.5)
+        expect(doubleFromBits(emulator.getFloatingPointRegisterValues()[0]!)).toBe(1.5)
         emulator.undo()
-        expect(emulator.getVfpRegisters().d[1]).toBe(0n)
+        expect(emulator.getFloatingPointRegisterValues()[1]!).toBe(0n)
         emulator.undo()
-        expect(emulator.getVfpRegisters().d[0]).toBe(0n)
+        expect(emulator.getFloatingPointRegisterValues()[0]!).toBe(0n)
     })
 
     it('keeps only the newest steps the history was sized for', async () => {
@@ -172,7 +172,7 @@ _start:
         expect(emulator.getRegisterValue('r0')).toBe(3n)
         emulator.undo()
         emulator.undo()
-        expect(emulator.getCpsr() & (1 << 5)).not.toBe(0)
+        expect(emulator.getFlagsRegister() & (1n << 5n)).not.toBe(0n)
         expect(emulator.getPc()).toBe(0x10000n)
         expect(await emulator.run(100)).toMatchObject({ kind: 'exit', exitCode: 24 })
     })

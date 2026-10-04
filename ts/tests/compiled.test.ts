@@ -44,7 +44,7 @@ _start:
         it(`runs them ${undo ? 'with' : 'without'} history`, async () => {
             const { emulator } = await load(SOURCE, { undo })
             expect(await emulator.run(10_000)).toMatchObject({ kind: 'exit', exitCode: 300 })
-            expect(doubleFromBits(emulator.getVfpRegisters().d[0]!)).toBe(512)
+            expect(doubleFromBits(emulator.getFloatingPointRegisterValues()[0]!)).toBe(512)
         })
     }
 
@@ -52,7 +52,7 @@ _start:
         const { emulator } = await load(SOURCE, { undo: 1000 })
         await emulator.run(10_000)
         for (let i = 0; i < 2 + 512; i++) expect(emulator.undo()).toBe(true)
-        expect(emulator.getVfpRegisters().d[0]).toBe(0n)
+        expect(emulator.getFloatingPointRegisterValues()[0]!).toBe(0n)
         expect(emulator.getRegisterValue('r0')).toBe(300n)
     })
 })

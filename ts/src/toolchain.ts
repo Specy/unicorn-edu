@@ -1,13 +1,15 @@
-import createAssembler from './wasm/arm-as.mjs'
-import createLinker from './wasm/arm-ld.mjs'
-import type { ToolModuleFactory } from './wasm/tool-module'
+import type { Architecture, ToolSpec } from './architecture'
 import type { ArmDiagnostic, ArmProject } from './types'
+import type { ToolModuleFactory } from './wasm/tool-module'
 
 /** Where a tool sees the Project: Files keep their root-relative paths below it. */
 export const WORK_DIRECTORY = '/work'
 
-/** The CPU the emulator models (Unicorn's default for ARM mode): ARMv7-A with VFPv4 and NEON. */
-export const ASSEMBLER_FLAGS = ['-mcpu=cortex-a15', '-mfpu=neon-vfpv4', '-mfloat-abi=hard']
+/**
+ * The linker's warnings about executable stacks and RWX segments describe a hosted Linux
+ * executable; this is a bare program image, so they would only be noise.
+ */
+const LINKER_FLAGS = ['--no-warn-execstack', '--no-warn-rwx-segments']
 
 export type MemoryLayout = {
     /** Where `.text` starts. */
@@ -17,7 +19,7 @@ export type MemoryLayout = {
     stackSize: number
     /** How far `brk` may grow the heap above the program. */
     heapLimit: number
-    /** A page of code that turns a return from the entry point into `exit(r0)`. */
+    /** A page of code that turns a return from the entry point into an exit with its result. */
     returnTrampoline: number
 }
 
@@ -60,6 +62,7 @@ export type ToolRun = {
 }
 
 const compiledModules = new Map<string, Promise<WebAssembly.Module>>()
+const toolFactories = new Map<string, Promise<ToolModuleFactory>>()
 
 async function compileWasm(url: URL): Promise<WebAssembly.Module> {
     if (url.protocol === 'file:') {
@@ -72,26 +75,25 @@ async function compileWasm(url: URL): Promise<WebAssembly.Module> {
     return WebAssembly.compile(await response.arrayBuffer())
 }
 
-/**
- * Each URL is a literal `new URL(..., import.meta.url)`, the form bundlers recognize and copy
- * the asset for.
- */
-const TOOL_WASM: Record<string, () => URL> = {
-    'arm-as': () => new URL('./wasm/arm-as.wasm', import.meta.url),
-    'arm-ld': () => new URL('./wasm/arm-ld.wasm', import.meta.url),
-}
-
 /** Compiles a tool's .wasm once; every run instantiates it afresh, which takes milliseconds. */
-function wasmModule(name: string): Promise<WebAssembly.Module> {
-    let compiled = compiledModules.get(name)
+function wasmModule(tool: ToolSpec): Promise<WebAssembly.Module> {
+    let compiled = compiledModules.get(tool.name)
     if (!compiled) {
-        const url = TOOL_WASM[name]
-        if (!url) throw new Error(`unknown tool ${name}`)
-        compiled = compileWasm(url())
-        compiledModules.set(name, compiled)
-        compiled.catch(() => compiledModules.delete(name))
+        compiled = compileWasm(tool.wasm())
+        compiledModules.set(tool.name, compiled)
+        compiled.catch(() => compiledModules.delete(tool.name))
     }
     return compiled
+}
+
+function toolFactory(tool: ToolSpec): Promise<ToolModuleFactory> {
+    let factory = toolFactories.get(tool.name)
+    if (!factory) {
+        factory = tool.load()
+        toolFactories.set(tool.name, factory)
+        factory.catch(() => toolFactories.delete(tool.name))
+    }
+    return factory
 }
 
 /**
@@ -100,17 +102,16 @@ function wasmModule(name: string): Promise<WebAssembly.Module> {
  * state between runs, so an instance is never reused.
  */
 export async function runTool(
-    factory: ToolModuleFactory,
-    name: string,
+    tool: ToolSpec,
     args: string[],
     files: Readonly<Record<string, string | Uint8Array>>,
     outputs: readonly string[],
 ): Promise<ToolRun> {
     let stdout = ''
     let stderr = ''
-    const compiled = await wasmModule(name)
+    const [factory, compiled] = await Promise.all([toolFactory(tool), wasmModule(tool)])
     const module = await factory({
-        thisProgram: name.endsWith('-as') ? 'as' : 'ld',
+        thisProgram: tool.name.endsWith('-as') ? 'as' : 'ld',
         print: (line) => (stdout += `${line}\n`),
         printErr: (line) => (stderr += `${line}\n`),
         instantiateWasm: (imports, receive) => {
@@ -196,7 +197,7 @@ export type AssembleResult = {
 }
 
 /** Assembles every translation unit with line information (`-g`) for the debugger. */
-export async function assembleProject(project: ArmProject): Promise<AssembleResult> {
+export async function assembleProject(project: ArmProject, architecture: Architecture): Promise<AssembleResult> {
     const diagnostics: ArmDiagnostic[] = []
     const units: AssembledUnit[] = []
     let ok = true
@@ -209,9 +210,8 @@ export async function assembleProject(project: ArmProject): Promise<AssembleResu
         const directory = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '.'
         const objectPath = `${path}.o`
         const run = await runTool(
-            createAssembler,
-            'arm-as',
-            [...ASSEMBLER_FLAGS, '-g', '-I', directory, '-o', objectPath, path],
+            architecture.assembler,
+            [...architecture.assemblerFlags, '-g', '-I', directory, '-o', objectPath, path],
             project.files,
             [objectPath],
         )
@@ -234,14 +234,14 @@ export type LinkResult = { elf: Uint8Array | null; diagnostics: ArmDiagnostic[] 
 export async function linkProgram(
     units: AssembledUnit[],
     project: ArmProject,
+    architecture: Architecture,
     layout: MemoryLayout = DEFAULT_LAYOUT,
 ): Promise<LinkResult> {
     const files: Record<string, string | Uint8Array> = { 'link.ld': linkerScript(layout) }
     for (const unit of units) files[`${unit.path}.o`] = unit.object
     const run = await runTool(
-        createLinker,
-        'arm-ld',
-        ['-T', 'link.ld', '-o', 'program.elf', ...units.map((unit) => `${unit.path}.o`)],
+        architecture.linker,
+        [...LINKER_FLAGS, '-T', 'link.ld', '-o', 'program.elf', ...units.map((unit) => `${unit.path}.o`)],
         files,
         ['program.elf'],
     )
