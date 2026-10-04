@@ -1,0 +1,38 @@
+{
+  "name": "@specy/unicorn-edu",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "An educational ARM emulator for JavaScript: Unicorn with a debugger layer, plus GNU as and ld, all in WebAssembly",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Specy/unicorn-edu.git",
+    "directory": "ts"
+  },
+  "types": "./dist/index.d.mts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs",
+      "default": "./dist/index.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsdown && node scripts/copy-assets.mjs",
+    "build:wasm": "../scripts/build-unicorn.sh arm && ../scripts/build-binutils.sh arm",
+    "test": "vitest run",
+    "type-check": "tsc --noEmit",
+    "measure": "vitest run --config vitest.measure.config.ts --disable-console-intercept",
+    "test:dist": "node tests/dist-smoke.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsdown": "^0.21.7",
+    "typescript": "^6.0.2",
+    "vitest": "^3.0.0"
+  }
+}
