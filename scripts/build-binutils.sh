@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds GNU as and ld 2.45 as WebAssembly programs under ts/src/wasm/:
 #
-#   scripts/build-binutils.sh [target]      target: arm (default) -> arm-none-eabi
+#   scripts/build-binutils.sh [target]      target: arm (default) -> arm-none-eabi,
+#                                            aarch64 -> aarch64-none-elf
 #
 # Each tool is an ES module (MODULARIZE + EXPORT_ES6) with its .wasm beside it, run with
 # `callMain` over Emscripten's in-memory filesystem. Needs emcc/emconfigure/emmake on
@@ -20,6 +21,7 @@ SOURCE="$ROOT/build/binutils-$VERSION"
 TARGET_NAME="${1:-arm}"
 case "$TARGET_NAME" in
     arm) TRIPLE=arm-none-eabi ;;
+    aarch64) TRIPLE=aarch64-none-elf ;;
     *) echo "unsupported target: $TARGET_NAME" >&2; exit 1 ;;
 esac
 

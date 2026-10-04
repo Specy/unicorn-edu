@@ -3,7 +3,7 @@
 # patches in patches/, and the debugger layer in native/, as an ES module and its
 # .wasm under ts/src/wasm/.
 #
-#   scripts/build-unicorn.sh [arch]      arch: arm (default)
+#   scripts/build-unicorn.sh [arch]      arch: arm (default) or aarch64
 #
 # Needs emcc/emcmake on PATH (source ~/emsdk/emsdk_env.sh), cmake 3.x/4.x and
 # python3. The Unicorn submodule is patched in place the first time and left
@@ -25,7 +25,7 @@ fi
 
 ARCH="${1:-arm}"
 case "$ARCH" in
-    arm) ;;
+    arm|aarch64) ;;
     *) echo "unsupported arch: $ARCH" >&2; exit 1 ;;
 esac
 

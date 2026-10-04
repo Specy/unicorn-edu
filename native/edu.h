@@ -58,8 +58,9 @@ enum edu_frame_op {
 
 /* --- lifecycle ---------------------------------------------------------------------- */
 
-/* A machine for `arch`/`mode` (Unicorn's UC_ARCH_*, UC_MODE_*). `cpu_model` is a
-   UC_CPU_* value, or -1 for Unicorn's default. 32-bit ARM starts with VFP/NEON enabled.
+/* A machine for `arch`/`mode` (Unicorn's UC_ARCH_*, UC_MODE_*): UC_ARCH_ARM or UC_ARCH_ARM64.
+   `cpu_model` is a UC_CPU_* value, or -1 for Unicorn's default (Cortex-A15, Cortex-A72).
+   32-bit ARM starts with VFP/NEON enabled, as AArch64 starts with FP/SIMD.
    Returns NULL on failure; `edu_last_create_error` says why. */
 EDU_API edu_machine *edu_create(int arch, int mode, int cpu_model);
 EDU_API int edu_last_create_error(void);

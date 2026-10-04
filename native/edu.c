@@ -86,13 +86,14 @@ struct edu_machine {
     void *core_pointers[EDU_MAX_CORE];
     uint64_t core_scratch[EDU_MAX_CORE];
 
-    /* floating-point registers, saved around instructions that may change them */
+    /* floating-point registers, saved around instructions that may change them; 16 bytes a
+       slot, the width of an AArch64 V register */
     const int *fp_ids;
     const uint8_t *fp_sizes;
     uint32_t fp_count;
     void *fp_pointers[EDU_MAX_FP];
-    uint64_t fp_scratch[EDU_MAX_FP];
-    uint64_t fp_before[EDU_MAX_FP];
+    uint8_t fp_scratch[EDU_MAX_FP][16];
+    uint8_t fp_before[EDU_MAX_FP][16];
     uint64_t fp_map_base;
     uint32_t fp_map_halfwords;
     uint8_t *fp_map;
@@ -158,6 +159,20 @@ static const int ARM_CORE_IDS[] = {
 #define ARM_FP_COUNT 33
 static int arm_fp_ids[ARM_FP_COUNT];
 static uint8_t arm_fp_sizes[ARM_FP_COUNT];
+
+static const int ARM64_CORE_IDS[] = {
+    UC_ARM64_REG_X0,  UC_ARM64_REG_X1,  UC_ARM64_REG_X2,  UC_ARM64_REG_X3,  UC_ARM64_REG_X4,
+    UC_ARM64_REG_X5,  UC_ARM64_REG_X6,  UC_ARM64_REG_X7,  UC_ARM64_REG_X8,  UC_ARM64_REG_X9,
+    UC_ARM64_REG_X10, UC_ARM64_REG_X11, UC_ARM64_REG_X12, UC_ARM64_REG_X13, UC_ARM64_REG_X14,
+    UC_ARM64_REG_X15, UC_ARM64_REG_X16, UC_ARM64_REG_X17, UC_ARM64_REG_X18, UC_ARM64_REG_X19,
+    UC_ARM64_REG_X20, UC_ARM64_REG_X21, UC_ARM64_REG_X22, UC_ARM64_REG_X23, UC_ARM64_REG_X24,
+    UC_ARM64_REG_X25, UC_ARM64_REG_X26, UC_ARM64_REG_X27, UC_ARM64_REG_X28, UC_ARM64_REG_X29,
+    UC_ARM64_REG_X30, UC_ARM64_REG_SP,  UC_ARM64_REG_PC,  UC_ARM64_REG_NZCV,
+};
+#define ARM64_CORE_COUNT (sizeof(ARM64_CORE_IDS) / sizeof(ARM64_CORE_IDS[0]))
+#define ARM64_FP_COUNT 34
+static int arm64_fp_ids[ARM64_FP_COUNT];
+static uint8_t arm64_fp_sizes[ARM64_FP_COUNT];
 
 static int last_create_error = UC_ERR_OK;
 
@@ -353,9 +368,9 @@ static void finalize_previous(edu_machine *m, uint64_t pc, const uint64_t *lr_no
         if (entry) {
             uc_reg_read_batch(m->uc, (int *)m->fp_ids, m->fp_pointers, (int)m->fp_count);
             for (uint32_t i = 0; i < m->fp_count; i++) {
-                if (m->fp_scratch[i] == m->fp_before[i]) continue;
-                append_register_record(m, entry, m->fp_ids[i], m->fp_sizes[i], &m->fp_before[i],
-                                       &m->fp_scratch[i]);
+                if (!memcmp(m->fp_scratch[i], m->fp_before[i], m->fp_sizes[i])) continue;
+                append_register_record(m, entry, m->fp_ids[i], m->fp_sizes[i], m->fp_before[i],
+                                       m->fp_scratch[i]);
             }
         }
     }
@@ -399,7 +414,7 @@ static void on_code(uc_engine *uc, uint64_t address, uint32_t size, void *user) 
         m->previous_recorded = 1;
         if (is_fp_instruction(m, address)) {
             uc_reg_read_batch(uc, (int *)m->fp_ids, m->fp_pointers, (int)m->fp_count);
-            memcpy(m->fp_before, m->fp_scratch, m->fp_count * sizeof(uint64_t));
+            memcpy(m->fp_before, m->fp_scratch, sizeof(m->fp_before));
             m->fp_pending = 1;
         }
     }
@@ -506,6 +521,28 @@ EDU_API edu_machine *edu_create(int arch, int mode, int cpu_model) {
         uc_reg_write(uc, UC_ARM_REG_FPEXC, &fpexc);
         break;
     }
+    case UC_ARCH_ARM64: {
+        m->core_ids = ARM64_CORE_IDS;
+        m->core_count = ARM64_CORE_COUNT;
+        m->core_lr_index = 30;
+        m->pc_id = UC_ARM64_REG_PC;
+        m->lr_id = UC_ARM64_REG_X30;
+        m->sp_id = UC_ARM64_REG_SP;
+        m->flags_id = UC_ARM64_REG_NZCV;
+        for (int i = 0; i < 32; i++) {
+            arm64_fp_ids[i] = UC_ARM64_REG_V0 + i;
+            arm64_fp_sizes[i] = 16;
+        }
+        arm64_fp_ids[32] = UC_ARM64_REG_FPCR;
+        arm64_fp_sizes[32] = 4;
+        arm64_fp_ids[33] = UC_ARM64_REG_FPSR;
+        arm64_fp_sizes[33] = 4;
+        m->fp_ids = arm64_fp_ids;
+        m->fp_sizes = arm64_fp_sizes;
+        m->fp_count = ARM64_FP_COUNT;
+        /* floating point and SIMD are enabled at reset */
+        break;
+    }
     default:
         uc_close(uc);
         free(m);
@@ -513,7 +550,7 @@ EDU_API edu_machine *edu_create(int arch, int mode, int cpu_model) {
         return NULL;
     }
     for (uint32_t i = 0; i < EDU_MAX_CORE; i++) m->core_pointers[i] = &m->core_scratch[i];
-    for (uint32_t i = 0; i < EDU_MAX_FP; i++) m->fp_pointers[i] = &m->fp_scratch[i];
+    for (uint32_t i = 0; i < EDU_MAX_FP; i++) m->fp_pointers[i] = m->fp_scratch[i];
     m->interrupt_number = -1;
     err = uc_hook_add(uc, &m->code_hook, UC_HOOK_CODE, (void *)on_code, m, 1, 0);
     if (err == UC_ERR_OK) {
@@ -628,6 +665,20 @@ static uint32_t register_size(edu_machine *m, int id) {
         if (id >= UC_ARM_REG_D0 && id <= UC_ARM_REG_D31) return 8;
         if (id >= UC_ARM_REG_Q0 && id <= UC_ARM_REG_Q15) return 16;
         return 4;
+    }
+    if (m->arch == UC_ARCH_ARM64) {
+        if ((id >= UC_ARM64_REG_V0 && id <= UC_ARM64_REG_V31) ||
+            (id >= UC_ARM64_REG_Q0 && id <= UC_ARM64_REG_Q31)) {
+            return 16;
+        }
+        if (id >= UC_ARM64_REG_S0 && id <= UC_ARM64_REG_S31) return 4;
+        if (id >= UC_ARM64_REG_H0 && id <= UC_ARM64_REG_H31) return 2;
+        if (id >= UC_ARM64_REG_B0 && id <= UC_ARM64_REG_B31) return 1;
+        if (id >= UC_ARM64_REG_W0 && id <= UC_ARM64_REG_W30) return 4;
+        if (id == UC_ARM64_REG_NZCV || id == UC_ARM64_REG_FPCR || id == UC_ARM64_REG_FPSR ||
+            id == UC_ARM64_REG_PSTATE || id == UC_ARM64_REG_WSP) {
+            return 4;
+        }
     }
     return 8;
 }
