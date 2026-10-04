@@ -12,7 +12,8 @@ const files = ['machine-arm', 'arm-as', 'arm-ld', 'machine-aarch64', 'aarch64-as
   `${name}.d.mts`,
 ])
 
-files.push('tool-module.d.ts')
+// The notices travel with the binaries they describe: GNU as and ld need the GPL-3.0 text.
+files.push('tool-module.d.ts', 'NOTICE.md', 'GPL-3.0.txt')
 
 await mkdir(resolve(root, 'dist/wasm'), { recursive: true })
 for (const file of files) {

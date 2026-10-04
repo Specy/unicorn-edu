@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Educational ARM and AArch64 emulators for JavaScript: Unicorn with a debugger layer, plus GNU as and ld, all in WebAssembly",
+  "license": "GPL-2.0-only AND GPL-3.0-or-later",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Specy/unicorn-edu.git",
