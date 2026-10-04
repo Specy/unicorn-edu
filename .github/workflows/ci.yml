@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: ubuntu-24.04
+
+    steps:
+      # The WebAssembly modules (Unicorn with the debugger layer, GNU as, GNU ld) are committed
+      # under ts/src/wasm, so CI needs Node only. Rebuilding them needs Emscripten and takes
+      # minutes (scripts/build-unicorn.sh, scripts/build-binutils.sh); they are rebuilt by hand
+      # when native/, patches/ or the pinned versions change, and the result is committed.
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ts
+        run: npm ci
+
+      - name: Type-check
+        working-directory: ts
+        run: npm run type-check
+
+      - name: Run tests
+        working-directory: ts
+        run: npm test
+
+      - name: Build
+        working-directory: ts
+        run: npm run build
+
+      - name: Smoke-test the built package
+        working-directory: ts
+        run: npm run test:dist
